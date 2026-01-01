@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { createBareServer } from "@nebula-services/bare-server-node";
 import chalk from "chalk";
 import cookieParser from "cookie-parser";
@@ -9,117 +11,130 @@ import express from "express";
 import basicAuth from "express-basic-auth";
 import mime from "mime";
 import fetch from "node-fetch";
-// import { setupMasqr } from "./Masqr.js";
+
 import config from "./config.js";
 
-console.log(chalk.yellow("🚀 Starting server..."));
+console.log(chalk.yellow("🚀 Starting Interstellar server..."));
 
-const __dirname = process.cwd();
-const server = http.createServer();
+/* ------------------ Setup ------------------ */
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
+const server = http.createServer();
 const bareServer = createBareServer("/fq/");
 const PORT = process.env.PORT || 8080;
+
 const cache = new Map();
-const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // Cache for 30 Days
+const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/* ------------------ Security ------------------ */
 
 if (config.challenge !== false) {
-  console.log(
-    chalk.green("🔒 Password protection is enabled! Listing logins below"),
-  );
-  // biome-ignore lint/complexity/noForEach:
-  Object.entries(config.users).forEach(([username, password]) => {
-    console.log(chalk.blue(`Username: ${username}, Password: ${password}`));
+  console.log(chalk.green("🔒 Password protection enabled"));
+
+  Object.entries(config.users).forEach(([u, p]) => {
+    console.log(chalk.blue(`User: ${u} | Pass: ${p}`));
   });
-  app.use(basicAuth({ users: config.users, challenge: true }));
+
+  app.use(basicAuth({
+    users: config.users,
+    challenge: true
+  }));
 }
+
+/* ------------------ Middleware ------------------ */
+
+app.use(cookieParser());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use("/fq", cors({ origin: true }));
+
+/* ------------------ Asset Proxy + Cache ------------------ */
 
 app.get("/e/*", async (req, res, next) => {
   try {
     if (cache.has(req.path)) {
       const { data, contentType, timestamp } = cache.get(req.path);
-      if (Date.now() - timestamp > CACHE_TTL) {
-        cache.delete(req.path);
-      } else {
+
+      if (Date.now() - timestamp <= CACHE_TTL) {
         res.writeHead(200, { "Content-Type": contentType });
         return res.end(data);
       }
+
+      cache.delete(req.path);
     }
 
     const baseUrls = {
       "/e/1/": "https://raw.githubusercontent.com/qrs/x/fixy/",
       "/e/2/": "https://raw.githubusercontent.com/3v1/V5-Assets/main/",
-      "/e/3/": "https://raw.githubusercontent.com/3v1/V5-Retro/master/",
+      "/e/3/": "https://raw.githubusercontent.com/3v1/V5-Retro/master/"
     };
 
-    let reqTarget;
-    for (const [prefix, baseUrl] of Object.entries(baseUrls)) {
+    let target;
+    for (const [prefix, base] of Object.entries(baseUrls)) {
       if (req.path.startsWith(prefix)) {
-        reqTarget = baseUrl + req.path.slice(prefix.length);
+        target = base + req.path.slice(prefix.length);
         break;
       }
     }
 
-    if (!reqTarget) {
-      return next();
-    }
+    if (!target) return next();
 
-    const asset = await fetch(reqTarget);
-    if (!asset.ok) {
-      return next();
-    }
+    const response = await fetch(target);
+    if (!response.ok) return next();
 
-    const data = Buffer.from(await asset.arrayBuffer());
-    const ext = path.extname(reqTarget);
-    const no = [".unityweb"];
-    const contentType = no.includes(ext)
+    const data = Buffer.from(await response.arrayBuffer());
+    const ext = path.extname(target);
+    const contentType = [".unityweb"].includes(ext)
       ? "application/octet-stream"
-      : mime.getType(ext);
+      : mime.getType(ext) || "application/octet-stream";
 
-    cache.set(req.path, { data, contentType, timestamp: Date.now() });
+    cache.set(req.path, {
+      data,
+      contentType,
+      timestamp: Date.now()
+    });
+
     res.writeHead(200, { "Content-Type": contentType });
     res.end(data);
-  } catch (error) {
-    console.error("Error fetching asset:", error);
-    res.setHeader("Content-Type", "text/html");
-    res.status(500).send("Error fetching the asset");
+  } catch (err) {
+    console.error("Asset error:", err);
+    res.status(500).send("Asset fetch failed");
   }
 });
 
-app.use(cookieParser());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-/* if (process.env.MASQR === "true") {
-  console.log(chalk.green("Masqr is enabled"));
-  setupMasqr(app);
-} */
+/* ------------------ Static + Routes ------------------ */
 
 app.use(express.static(path.join(__dirname, "static")));
-app.use("/fq", cors({ origin: true }));
 
 const routes = [
+  { path: "/", file: "index.html" },
   { path: "/yz", file: "apps.html" },
   { path: "/up", file: "games.html" },
   { path: "/vk", file: "settings.html" },
-  { path: "/rx", file: "tabs.html" },
-  { path: "/", file: "index.html" },
+  { path: "/rx", file: "tabs.html" }
 ];
 
-// biome-ignore lint/complexity/noForEach:
-routes.forEach(route => {
-  app.get(route.path, (_req, res) => {
-    res.sendFile(path.join(__dirname, "static", route.file));
+routes.forEach(({ path: route, file }) => {
+  app.get(route, (_req, res) => {
+    res.sendFile(path.join(__dirname, "static", file));
   });
 });
 
-app.use((req, res, next) => {
+/* ------------------ Errors ------------------ */
+
+app.use((_req, res) => {
   res.status(404).sendFile(path.join(__dirname, "static", "404.html"));
 });
 
-app.use((err, req, res, next) => {
-  console.error(err.stack);
+app.use((err, _req, res, _next) => {
+  console.error(err);
   res.status(500).sendFile(path.join(__dirname, "static", "404.html"));
 });
+
+/* ------------------ Bare Server Routing ------------------ */
 
 server.on("request", (req, res) => {
   if (bareServer.shouldRoute(req)) {
@@ -137,8 +152,8 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-server.on("listening", () => {
-  console.log(chalk.green(`🌍 Server is running on http://localhost:${PORT}`));
-});
+/* ------------------ Start Server ------------------ */
 
-server.listen({ port: PORT });
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(chalk.green(`🌍 Interstellar running on port ${PORT}`));
+});
